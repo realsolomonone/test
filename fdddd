@@ -1,0 +1,373 @@
+#!/bin/bash
+# =============================================================================
+#  aks-backup-setup.sh
+#  First-time AKS Backup setup via Azure Cloud Shell
+#  Cluster : sharedServices-k8s-cluster
+#  RG      : rg_vnet_sharedServices
+#  Vault   : sharedServices-backup-vault
+#  Location: USGov Virginia
+# =============================================================================
+set -euo pipefail
+
+# ── Config ────────────────────────────────────────────────────────────────────
+RG="rg_vnet_sharedServices"
+AKS="sharedServices-k8s-cluster"
+VAULT="sharedServices-backup-vault"
+LOCATION="USGovVirginia"
+# FIX: Storage account name must be <= 24 chars, lowercase alphanumeric only.
+#      Compute once and store — avoids calling az account show multiple times.
+SUBSCRIPTION_ID=$(az account show --query id -o tsv)
+STORAGE_ACCOUNT="(echo "$SUBSCRIPTION_ID" | tr -d '-' | cut -c1-16)"
+BLOB_CONTAINER="aks-backup-container"
+BACKUP_POLICY="aks-daily-backup-policy"
+BACKUP_INSTANCE="aks-backup-instance"
+
+echo "=============================================="
+echo "  AKS Backup Setup"
+echo "  RG       : $RG"
+echo "  AKS      : $AKS"
+echo "  Vault    : $VAULT"
+echo "  Location : $LOCATION"
+echo "  Storage  : $STORAGE_ACCOUNT"
+echo "=============================================="
+
+# ── Step 1: Register required providers ──────────────────────────────────────
+echo ""
+echo "[Step 1] Registering required resource providers..."
+az provider register --namespace Microsoft.KubernetesConfiguration --wait
+az provider register --namespace Microsoft.DataProtection --wait
+az provider register --namespace Microsoft.ContainerService --wait
+echo "✓ Providers registered"
+
+# ── Step 2: Install required CLI extensions ───────────────────────────────────
+echo ""
+echo "[Step 2] Installing Azure CLI extensions..."
+az extension add --name k8s-extension   --upgrade -y 2>/dev/null || true
+az extension add --name dataprotection  --upgrade -y 2>/dev/null || true
+az extension add --name aks-preview     --upgrade -y 2>/dev/null || true
+echo "✓ Extensions installed"
+
+# ── Step 3: Create Backup Vault ───────────────────────────────────────────────
+echo ""
+echo "[Step 3] Creating Backup Vault: $VAULT..."
+az dataprotection backup-vault create \
+  --resource-group "$RG" \
+  --vault-name    "$VAULT" \
+  --location      "$LOCATION" \
+  --type SystemAssigned \
+  --storage-settings datastore-type="VaultStore" type="LocallyRedundant" \
+  --output table 2>/dev/null || echo "  Vault already exists — continuing"
+echo "✓ Backup Vault ready"
+
+# ── Step 4: Create Storage Account for backup staging ─────────────────────────
+echo ""
+echo "[Step 4] Creating Storage Account: $STORAGE_ACCOUNT..."
+az storage account create \
+  --name              "$STORAGE_ACCOUNT" \
+  --resource-group    "$RG" \
+  --location          "$LOCATION" \
+  --sku               Standard_LRS \
+  --kind              StorageV2 \
+  --output table 2>/dev/null || echo "  Storage account already exists — continuing"
+
+# FIX: Wait for the storage account to be fully provisioned before
+#      listing keys; without this the key query can return empty.
+echo "  Waiting for storage account to be ready..."
+az storage account show \
+  --name           "$STORAGE_ACCOUNT" \
+  --resource-group "$RG" \
+  --query          "provisioningState" \
+  -o tsv
+
+az storage container create \
+  --name         "$BLOB_CONTAINER" \
+  --account-name "$STORAGE_ACCOUNT" \
+  --auth-mode    login \
+  --output table 2>/dev/null || true
+echo "✓ Storage Account and container ready"
+
+# ── Step 5: Install Backup Extension on AKS ──────────────────────────────────
+# FIX: The original command blocks indefinitely waiting for provisioning.
+#      Use --no-wait so the CLI returns immediately, then poll until done.
+echo ""
+echo "[Step 5] Installing AKS Backup Extension (async)..."
+
+# Check if extension already exists
+EXISTING=$(az k8s-extension show \
+  --name          azure-aks-backup \
+  --cluster-type  managedClusters \
+  --cluster-name  "$AKS" \
+  --resource-group "$RG" \
+  --query          "provisioningState" \
+  -o tsv 2>/dev/null || echo "NotFound")
+
+if [[ "$EXISTING" == "Succeeded" ]]; then
+  echo "  Extension already installed and healthy — skipping"
+else
+  az k8s-extension create \
+    --name           azure-aks-backup \
+    --extension-type microsoft.dataprotection.kubernetes \
+    --scope          cluster \
+    --cluster-type   managedClusters \
+    --cluster-name   "$AKS" \
+    --resource-group "$RG" \
+    --release-train  stable \
+    --configuration-settings \
+      storageAccount="$STORAGE_ACCOUNT" \
+      storageAccountResourceGroup="$RG" \
+      storageAccountSubscriptionId="$SUBSCRIPTION_ID" \
+      blobContainer="$BLOB_CONTAINER" \
+    --no-wait \
+    --output table 2>/dev/null || echo "  Extension create initiated (may already exist)"
+
+  # Poll until Succeeded or Failed (timeout: 20 min)
+  echo "  Polling extension provisioning state (timeout 20 min)..."
+  TIMEOUT=1200
+  INTERVAL=30
+  ELAPSED=0
+  while true; do
+    STATE=$(az k8s-extension show \
+      --name           azure-aks-backup \
+      --cluster-type   managedClusters \
+      --cluster-name   "$AKS" \
+      --resource-group "$RG" \
+      --query          "provisioningState" \
+      -o tsv 2>/dev/null || echo "Pending")
+
+    echo "  [${ELAPSED}s] State: $STATE"
+
+    if [[ "$STATE" == "Succeeded" ]]; then
+      break
+    elif [[ "$STATE" == "Failed" ]]; then
+      echo "ERROR: Extension provisioning failed. Check:"
+      echo "  az k8s-extension show --name azure-aks-backup --cluster-type managedClusters --cluster-name $AKS --resource-group $RG"
+      exit 1
+    fi
+
+    ELAPSED=$((ELAPSED + INTERVAL))
+    if [[ $ELAPSED -ge $TIMEOUT ]]; then
+      echo "WARNING: Timed out after ${TIMEOUT}s. Check state manually; continuing script."
+      break
+    fi
+
+    sleep "$INTERVAL"
+  done
+fi
+echo "✓ AKS Backup Extension installed"
+
+# ── Step 6: Enable Trusted Access between AKS and Backup Vault ────────────────
+echo ""
+echo "[Step 6] Enabling Trusted Access..."
+VAULT_ID=$(az dataprotection backup-vault show \
+  --resource-group "$RG" \
+  --vault-name     "$VAULT" \
+  --query id -o tsv)
+
+az aks trustedaccess rolebinding create \
+  --resource-group "$RG" \
+  --cluster-name   "$AKS" \
+  --name           aks-backup-binding \
+  --source-resource-id "$VAULT_ID" \
+  --roles          Microsoft.DataProtection/backupVaults/backup-operator \
+  --output table 2>/dev/null || echo "  Trusted access already configured — continuing"
+echo "✓ Trusted Access enabled"
+
+# ── Step 7: Assign permissions to Backup Vault ────────────────────────────────
+echo ""
+echo "[Step 7] Assigning permissions to Backup Vault managed identity..."
+VAULT_PRINCIPAL=$(az dataprotection backup-vault show \
+  --resource-group "$RG" \
+  --vault-name     "$VAULT" \
+  --query          identity.principalId -o tsv)
+
+AKS_ID=$(az aks show \
+  --resource-group "$RG" \
+  --name           "$AKS" \
+  --query          id -o tsv)
+
+STORAGE_ID=$(az storage account show \
+  --name           "$STORAGE_ACCOUNT" \
+  --resource-group "$RG" \
+  --query          id -o tsv)
+
+# Vault needs Reader on AKS
+az role assignment create \
+  --assignee "$VAULT_PRINCIPAL" \
+  --role     "Reader" \
+  --scope    "$AKS_ID" \
+  --output table 2>/dev/null || true
+
+# Vault needs Storage Blob Data Contributor on storage
+az role assignment create \
+  --assignee "$VAULT_PRINCIPAL" \
+  --role     "Storage Blob Data Contributor" \
+  --scope    "$STORAGE_ID" \
+  --output table 2>/dev/null || true
+
+echo "✓ Permissions assigned"
+
+# ── Step 8: Create Backup Policy ──────────────────────────────────────────────
+echo ""
+echo "[Step 8] Creating Backup Policy: $BACKUP_POLICY..."
+POLICY_JSON=$(cat << 'POLICYJSON'
+{
+  "name": "aks-daily-backup-policy",
+  "properties": {
+    "policyRules": [
+      {
+        "name": "BackupHourly",
+        "objectType": "AzureRetentionRule",
+        "isDefault": true,
+        "lifecycles": [
+          {
+            "deleteAfter": {
+              "objectType": "AbsoluteDeleteOption",
+              "duration": "P30D"
+            },
+            "targetDataStoreCopySettings": [],
+            "sourceDataStore": {
+              "dataStoreType": "OperationalStore",
+              "objectType": "DataStoreInfoBase"
+            }
+          }
+        ]
+      },
+      {
+        "name": "Default",
+        "objectType": "AzureBackupRule",
+        "backupParameters": {
+          "backupType": "Incremental",
+          "objectType": "AzureBackupParams"
+        },
+        "dataStore": {
+          "dataStoreType": "OperationalStore",
+          "objectType": "DataStoreInfoBase"
+        },
+        "trigger": {
+          "schedule": {
+            "timeZone": "UTC",
+            "repeatingTimeIntervals": ["R/2024-01-01T02:00:00+00:00/PT4H"]
+          },
+          "taggingCriteria": [
+            {
+              "isDefault": true,
+              "taggingPriority": 99,
+              "tagInfo": {
+                "id": "Default_",
+                "tagName": "Default"
+              }
+            }
+          ],
+          "objectType": "ScheduleBasedTriggerContext"
+        }
+      }
+    ],
+    "datasourceTypes": ["Microsoft.ContainerService/managedClusters"],
+    "objectType": "BackupPolicy"
+  }
+}
+POLICYJSON
+)
+
+echo "$POLICY_JSON" > /tmp/backup-policy.json
+
+az dataprotection backup-policy create \
+  --resource-group "$RG" \
+  --vault-name     "$VAULT" \
+  --name           "$BACKUP_POLICY" \
+  --policy         /tmp/backup-policy.json \
+  --output table 2>/dev/null || echo "  Policy already exists — continuing"
+echo "✓ Backup Policy created (every 4 hours, 30-day retention)"
+
+# ── Step 9: Create Backup Instance ────────────────────────────────────────────
+echo ""
+echo "[Step 9] Creating Backup Instance..."
+POLICY_ID=$(az dataprotection backup-policy show \
+  --resource-group "$RG" \
+  --vault-name     "$VAULT" \
+  --name           "$BACKUP_POLICY" \
+  --query id -o tsv)
+
+az dataprotection backup-instance create \
+  --resource-group "$RG" \
+  --vault-name     "$VAULT" \
+  --backup-instance "{
+    \"name\": \"$BACKUP_INSTANCE\",
+    \"properties\": {
+      \"friendlyName\": \"$BACKUP_INSTANCE\",
+      \"dataSourceInfo\": {
+        \"resourceId\": \"$AKS_ID\",
+        \"resourceUri\": \"$AKS_ID\",
+        \"datasourceType\": \"Microsoft.ContainerService/managedClusters\",
+        \"resourceName\": \"$AKS\",
+        \"resourceType\": \"Microsoft.ContainerService/managedClusters\",
+        \"resourceLocation\": \"$LOCATION\",
+        \"objectType\": \"Datasource\"
+      },
+      \"dataSourceSetInfo\": {
+        \"resourceId\": \"$AKS_ID\",
+        \"resourceUri\": \"$AKS_ID\",
+        \"datasourceType\": \"Microsoft.ContainerService/managedClusters\",
+        \"resourceName\": \"$AKS\",
+        \"resourceType\": \"Microsoft.ContainerService/managedClusters\",
+        \"resourceLocation\": \"$LOCATION\",
+        \"objectType\": \"DatasourceSet\"
+      },
+      \"policyInfo\": {
+        \"policyId\": \"$POLICY_ID\"
+      },
+      \"objectType\": \"BackupInstance\"
+    }
+  }" \
+  --output table 2>/dev/null || echo "  Backup instance already exists — continuing"
+echo "✓ Backup Instance created"
+
+# ── Step 10: Trigger an immediate backup ─────────────────────────────────────
+echo ""
+echo "[Step 10] Triggering initial backup..."
+az dataprotection backup-instance adhoc-backup \
+  --resource-group      "$RG" \
+  --vault-name          "$VAULT" \
+  --backup-instance-name "$BACKUP_INSTANCE" \
+  --rule-name           "Default" \
+  --output table 2>/dev/null || echo "  Could not trigger immediate backup — check permissions"
+
+# ── Summary ───────────────────────────────────────────────────────────────────
+echo ""
+echo "=============================================="
+echo "  AKS Backup Setup Complete"
+echo "=============================================="
+echo "  Vault          : $VAULT"
+echo "  Storage Account: $STORAGE_ACCOUNT"
+echo "  Blob Container : $BLOB_CONTAINER"
+echo "  Backup Policy  : $BACKUP_POLICY (every 4h, 30-day retention)"
+echo "  Backup Instance: $BACKUP_INSTANCE"
+echo "=============================================="
+
+# ── Step 11: List backup instance and recent jobs ─────────────────────────────
+echo ""
+echo "[Step 11] Verifying backup configuration..."
+
+echo ""
+echo "── Backup Instance ───────────────────────────"
+az dataprotection backup-instance list \
+  --resource-group "$RG" \
+  --vault-name     "$VAULT" \
+  --query          "[].{Name:name, State:properties.currentProtectionState, Health:properties.protectionStatus.status}" \
+  --output table 2>/dev/null || echo "  Could not list backup instances"
+
+echo ""
+echo "── Recent Backup Jobs (last 10) ──────────────"
+az dataprotection job list \
+  --resource-group "$RG" \
+  --vault-name     "$VAULT" \
+  --query          "[0:10].{Job:name, Operation:properties.operation, Status:properties.status, Started:properties.startTime, Ended:properties.endTime}" \
+  --output table 2>/dev/null || echo "  No backup jobs found yet — the scheduled backup will appear here once it runs"
+
+echo ""
+echo "  To re-check jobs at any time:"
+echo "  az dataprotection job list \\"
+echo "    --resource-group $RG \\"
+echo "    --vault-name $VAULT \\"
+echo "    --output table"
+echo "=============================================="
